@@ -1,30 +1,38 @@
+// server.js (ESM)
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import axios from "axios";
-import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import morgan from "morgan";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import axios from "axios";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, ".env") }); // server.js와 같은 폴더의 .env를 확정 로드
 
 /* =======================
-   상수/맵/유틸
+   상수/유틸
 ======================= */
 const API_HOST = "https://api.neople.co.kr";
-const NEOPLE_API_KEY = process.env.NEOPLE_API_KEY || "";
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
-const POLL_INTERVAL_SEC = 15;
-const DEDUPE_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+const NEOPLE_API_KEY = (process.env.NEOPLE_API_KEY ?? "").trim();
 
+if (!NEOPLE_API_KEY) {
+  console.warn(
+    "[WARN] NEOPLE_API_KEY 가 .env에 없습니다. 외부 API 호출이 실패합니다."
+  );
+} else {
+  console.log(`[apikey] loaded, length=${NEOPLE_API_KEY.length}`);
+}
+
+// 네오플 타임라인 아이템 관련 코드(획득/보상/제작/업그레이드 등)
 const ITEM_EVENT_CODES = [
   501, 502, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516,
   517, 518, 519, 520, 521,
 ].join(",");
 
-// 서버명 정규화(한글 허용)
+// 서버명 정규화(한글/영문 모두 허용)
 const SERVER_ID_MAP = {
   cain: "cain",
   siroco: "siroco",
@@ -46,360 +54,55 @@ const SERVER_ID_MAP = {
 function normalizeServerId(input) {
   if (!input) return "";
   const key = String(input).trim().toLowerCase();
-  if (SERVER_ID_MAP[key]) return SERVER_ID_MAP[key];
-  const kr = Object.keys(SERVER_ID_MAP).find((k) => k.toLowerCase() === key);
-  return kr ? SERVER_ID_MAP[kr] : key;
+  return SERVER_ID_MAP[key] || key;
+}
+
+// 유틸: 초단위 ISO
+function isoSec(dt) {
+  return new Date(dt).toISOString().slice(0, 19) + "Z";
+}
+
+// 유틸: '태초' 판정(보조)
+function isAncientRarity(r) {
+  return typeof r === "string" && /태초|mythic|ancient/i.test(r);
 }
 
 /* =======================
    앱/미들웨어
 ======================= */
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const app = express();
-
 app.use(helmet());
-app.use(morgan("combined"));
-app.use(rateLimit({ windowMs: 60_000, max: 300 })); // 분당 300요청
-
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(morgan("combined"));
 
 /* =======================
-   헬스체크
+   네오플 API 래퍼
 ======================= */
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
 
-/* =======================
-   SSE 상태/구독/중복캐시
-======================= */
-const sseClients = new Set(); // Set<express.Response>
-const subscriptions = new Map(); // key: `${serverId}:${characterId}`
-const sentKeys = new Map(); // key: `${serverId}:${characterId}:${itemId}:${timeISO}` -> expireAt
+// 닉네임으로 캐릭터 목록(완전일치 → 포함)
+async function searchCharacters({ serverId, name, limit = 10 }) {
+  const base = `${API_HOST}/df/servers/${encodeURIComponent(
+    serverId
+  )}/characters`;
 
-function sseBroadcast(eventObj) {
-  const payload = `data: ${JSON.stringify(eventObj)}\n\n`;
-  for (const res of sseClients) {
-    try {
-      res.write(payload);
-    } catch {}
-  }
-}
-function makeEventKey({ serverId, characterId, itemId, timeISO }) {
-  return `${serverId}:${characterId}:${itemId}:${timeISO}`;
-}
-function putDedupe(key) {
-  sentKeys.set(key, Date.now() + DEDUPE_TTL_MS);
-}
-function hasDedupe(key) {
-  const exp = sentKeys.get(key);
-  if (!exp) return false;
-  if (exp < Date.now()) {
-    sentKeys.delete(key);
-    return false;
-  }
-  return true;
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, exp] of sentKeys.entries()) if (exp < now) sentKeys.delete(k);
-}, 60_000);
-
-/* =======================
-   Discord Webhook (임베드)
-======================= */
-async function notifyDiscordDrop({
-  serverId,
-  characterId,
-  itemName,
-  itemId,
-  time,
-}) {
-  if (!DISCORD_WEBHOOK_URL) return;
-  const img = `https://img-api.dfoneople.com/df/items/${encodeURIComponent(
-    itemId
-  )}`;
-  const payload = {
-    content: `🎉 [${serverId}/${characterId}] 태초 아이템 획득!`,
-    embeds: [
-      {
-        title: itemName,
-        description: `획득 시각: ${time}`,
-        thumbnail: { url: img },
-      },
-    ],
-  };
-  await axios.post(DISCORD_WEBHOOK_URL, payload);
-}
-
-/* =======================
-   SSE 엔드포인트
-======================= */
-app.get("/events", (req, res) => {
-  res.set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  res.flushHeaders?.();
-  res.write(`event: ping\ndata: "connected"\n\n`);
-  sseClients.add(res);
-  req.on("close", () => sseClients.delete(res));
-});
-
-/* =======================
-   캐릭터 검색(닉네임 → 목록)
-======================= */
-app.get("/search-character", async (req, res) => {
-  try {
-    let serverId = String(req.query.serverId || "");
-    const name = String(req.query.name || "");
-    if (!serverId || !name)
-      return res
-        .status(400)
-        .json({ ok: false, message: "serverId, name 필요" });
-
-    serverId = normalizeServerId(serverId);
-    const url = `${API_HOST}/df/servers/${encodeURIComponent(
-      serverId
-    )}/characters`;
-    const { data } = await axios.get(url, {
-      params: { characterName: name, limit: 10, apikey: NEOPLE_API_KEY },
-      timeout: 10000,
-    });
-    res.json({ ok: true, ...data });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-/* =======================
-   구독 등록 (닉네임 전용)
-======================= */
-app.post("/subscribe-name", async (req, res) => {
-  try {
-    let { serverId, characterName, limit = 10 } = req.body ?? {};
-    if (!serverId || !characterName)
-      return res
-        .status(400)
-        .json({ ok: false, message: "serverId, characterName 필수" });
-
-    serverId = normalizeServerId(serverId);
-    const baseUrl = `${API_HOST}/df/servers/${encodeURIComponent(
-      serverId
-    )}/characters`;
-    const common = { apikey: NEOPLE_API_KEY, limit };
-
-    // (1) 완전일치 → (2) match
-    const { data: d1 } = await axios.get(baseUrl, {
-      params: { ...common, characterName, wordType: "full" },
-      timeout: 10000,
-    });
-    let candidates = Array.isArray(d1?.rows) ? d1.rows : [];
-    if (candidates.length === 0) {
-      const { data: d2 } = await axios.get(baseUrl, {
-        params: { ...common, characterName, wordType: "match" },
-        timeout: 10000,
-      });
-      candidates = Array.isArray(d2?.rows) ? d2.rows : [];
-    }
-    if (candidates.length === 0)
-      return res
-        .status(404)
-        .json({ ok: false, message: "닉네임으로 캐릭터를 찾을 수 없음" });
-
-    const exact =
-      candidates.find((r) => r.characterName === characterName) ||
-      candidates[0];
-    const characterId = exact?.characterId;
-    if (!characterId)
-      return res
-        .status(404)
-        .json({ ok: false, message: "characterId 획득 실패" });
-
-    const key = `${serverId}:${characterId}`;
-    subscriptions.set(key, {
-      serverId,
-      characterId,
-      lastCheckedISO: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-      createdAt: new Date().toISOString(),
-    });
-    res.json({
-      ok: true,
-      serverId,
-      characterId,
-      characterName: exact.characterName,
-      count: subscriptions.size,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-/* =======================
-   구독 등록 (ID 직접)
-   - 닉네임이 들어오면 자동 변환
-======================= */
-app.post("/subscribe", async (req, res) => {
-  try {
-    let { serverId, characterId } = req.body ?? {};
-    if (!serverId || !characterId)
-      return res
-        .status(400)
-        .json({ ok: false, message: "serverId, characterId 필수" });
-
-    serverId = normalizeServerId(serverId);
-    characterId = String(characterId).trim();
-
-    // 닉네임으로 보이면 변환
-    const looksLikeName = /[^\w-]/.test(characterId);
-    if (looksLikeName) {
-      const url = `${API_HOST}/df/servers/${encodeURIComponent(
-        serverId
-      )}/characters`;
-      const { data } = await axios.get(url, {
-        params: {
-          characterName: characterId,
-          wordType: "full",
-          limit: 5,
-          apikey: NEOPLE_API_KEY,
-        },
-        timeout: 10000,
-      });
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
-      const exact =
-        rows.find((r) => r.characterName === characterId) || rows[0];
-      if (!exact?.characterId)
-        return res
-          .status(404)
-          .json({ ok: false, message: "닉네임으로 characterId를 찾지 못함" });
-      characterId = exact.characterId;
-    }
-
-    const key = `${serverId}:${characterId}`;
-    subscriptions.set(key, {
-      serverId,
-      characterId,
-      lastCheckedISO: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-      createdAt: new Date().toISOString(),
-    });
-    res.json({ ok: true, serverId, characterId, count: subscriptions.size });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-
-/* =======================
-   네오플 API 유틸
-======================= */
-async function fetchTimelineAll({
-  serverId,
-  characterId,
-  startISO,
-  endISO,
-  limit = 50,
-}) {
-  serverId = normalizeServerId(serverId);
-  let url =
-    `${API_HOST}/df/servers/${encodeURIComponent(serverId)}` +
-    `/characters/${encodeURIComponent(characterId)}/timeline` +
-    `?startDate=${encodeURIComponent(startISO)}` +
-    `&endDate=${encodeURIComponent(endISO)}` +
-    `&limit=${limit}` +
-    `&code=${encodeURIComponent(ITEM_EVENT_CODES)}` +
-    `&apikey=${encodeURIComponent(NEOPLE_API_KEY)}`;
-
-  const collected = [];
-  for (let page = 0; page < 10; page++) {
-    const { data } = await axios.get(url, { timeout: 10000 });
-    const tl = Array.isArray(data?.timeline) ? data.timeline : [];
-    collected.push(...tl);
-    const next = data?.next;
-    if (!next) break;
-    url = next;
-  }
-  return collected;
-}
-async function fetchItemsDetail(itemIds) {
-  const unique = [...new Set(itemIds)].slice(0, 15);
-  if (unique.length === 0) return [];
-  const url = `${API_HOST}/df/multi/items`;
-  const { data } = await axios.get(url, {
-    params: { itemIds: unique.join(","), apikey: NEOPLE_API_KEY },
+  // 1) 완전일치
+  const pCommon = { apikey: NEOPLE_API_KEY, characterName: name, limit };
+  let { data } = await axios.get(base, {
+    params: { ...pCommon, wordType: "full" },
     timeout: 10000,
   });
-  return Array.isArray(data?.rows) ? data.rows : [];
-}
+  let rows = Array.isArray(data?.rows) ? data.rows : [];
 
-/* =======================
-   폴링 루프
-======================= */
-async function handleOneSubscription(sub) {
-  const endISO = new Date().toISOString();
-  const startISO =
-    sub.lastCheckedISO ||
-    new Date(Date.now() - POLL_INTERVAL_SEC * 1000).toISOString();
-
-  try {
-    const events = await fetchTimelineAll({
-      serverId: sub.serverId,
-      characterId: sub.characterId,
-      startISO,
-      endISO,
-    });
-    if (events.length === 0) {
-      sub.lastCheckedISO = endISO;
-      return;
-    }
-
-    const itemIds = events.map((ev) => ev?.data?.itemId).filter(Boolean);
-    const details = await fetchItemsDetail(itemIds);
-    const byId = new Map(details.map((it) => [it.itemId, it]));
-
-    for (const ev of events) {
-      const itemId = ev?.data?.itemId;
-      if (!itemId) continue;
-      const info = byId.get(itemId);
-      if (!info) continue;
-
-      if (info.rarity === "태초") {
-        const timeISO = ev?.date || endISO;
-        const key = makeEventKey({
-          serverId: sub.serverId,
-          characterId: sub.characterId,
-          itemId,
-          timeISO,
-        });
-        if (hasDedupe(key)) continue;
-
-        const payload = {
-          id: key,
-          type: "ancient-drop",
-          serverId: sub.serverId,
-          characterId: sub.characterId,
-          itemName: info.itemName || "무명 아이템",
-          itemId,
-          time: timeISO,
-        };
-
-        sseBroadcast(payload);
-        await notifyDiscordDrop(payload);
-        putDedupe(key);
-      }
-    }
-    sub.lastCheckedISO = endISO;
-  } catch (e) {
-    console.error(
-      "timeline error:",
-      sub.serverId,
-      sub.characterId,
-      e?.response?.status || e?.code || e?.message,
-      e?.response?.data || ""
-    );
+  // 2) 포함(match)
+  if (rows.length === 0) {
+    ({ data } = await axios.get(base, {
+      params: { ...pCommon, wordType: "match" },
+      timeout: 10000,
+    }));
+    rows = Array.isArray(data?.rows) ? data.rows : [];
   }
+  return rows;
 }
 
 // 캐릭터 기본정보
@@ -411,66 +114,198 @@ async function fetchCharacterBasic({ serverId, characterId }) {
     params: { apikey: NEOPLE_API_KEY },
     timeout: 10000,
   });
-  return data; // { characterId, characterName, level, jobName, jobGrowName, ... }
+  return data;
 }
 
-// 타임라인에서 '태초' 드랍만 추려 리스트 만들기 (최대 90일)
-async function listAncientDrops({ serverId, characterId }) {
-  const endISO = new Date().toISOString();
-  const startISO = new Date(
-    Date.now() - 90 * 24 * 60 * 60 * 1000
-  ).toISOString();
+// 타임라인 페이지네이션(안전한 next 처리 + /df 보정)
+async function fetchTimelineAll({
+  serverId,
+  characterId,
+  startISO,
+  endISO,
+  limit = 50,
+}) {
+  if (limit > 50) limit = 50;
+  serverId = normalizeServerId(serverId);
 
-  // 기존 fetchTimelineAll 재사용: &code=501..521 포함(아이템 관련 이벤트만) — 응답량 감소
+  // ① 정상 베이스
+  const base = `${API_HOST}/df/servers/${encodeURIComponent(
+    serverId
+  )}/characters/${encodeURIComponent(characterId)}/timeline`;
+
+  // ② 첫 페이지는 params로
+  let url = base;
+  let params = {
+    startDate: isoSec(startISO),
+    endDate: isoSec(endISO),
+    limit,
+    code: ITEM_EVENT_CODES, // 콤마 그대로
+    apikey: NEOPLE_API_KEY,
+  };
+
+  const out = [];
+  for (let page = 0; page < 10; page++) {
+    const safe = params ? { ...params, apikey: "[HIDDEN]" } : undefined;
+    console.log("[timeline] GET", url, safe || "(no params)");
+
+    const { data } = await axios.get(url, { params, timeout: 10000 });
+    const rows = Array.isArray(data?.timeline?.rows) ? data.timeline.rows : [];
+    out.push(...rows);
+
+    const rawNext = data?.timeline?.next;
+    console.log("[timeline] next(raw):", rawNext, "rows+", rows.length);
+    if (!rawNext || typeof rawNext !== "string") break;
+
+    // ③ next에서 '쿼리스트링만' 추출해서 베이스에 이식
+    let qs = "";
+    try {
+      // 절대/상대 모두 허용해서 일단 URL 객체로 만든 뒤 search만 뽑음
+      const u = /^https?:\/\//i.test(rawNext)
+        ? new URL(rawNext)
+        : new URL(
+            rawNext.startsWith("/")
+              ? `${API_HOST}${rawNext}`
+              : `${API_HOST}/${rawNext}`
+          );
+      qs = u.search || "";
+    } catch (e) {
+      console.error(
+        "[timeline] FAIL at",
+        url,
+        "status:",
+        err?.response?.status,
+        "body:",
+        err?.response?.data || err.message
+      );
+      throw err;
+    }
+
+    // ④ apikey 보장
+    const nextURL = new URL(base + qs);
+    if (!nextURL.searchParams.has("apikey"))
+      nextURL.searchParams.set("apikey", NEOPLE_API_KEY);
+    url = nextURL.toString();
+    params = undefined; // 다음 페이지부턴 url에 쿼리 포함
+    console.log("[timeline] next(normalized):", url);
+  }
+  return out;
+}
+
+/* =======================
+   도메인 로직: 요약
+======================= */
+
+function characterImageURL(serverId, characterId, zoom = 2) {
+  return `https://img-api.neople.co.kr/df/servers/${encodeURIComponent(
+    serverId
+  )}/characters/${encodeURIComponent(characterId)}?zoom=${zoom}`;
+}
+
+function itemImageURL(itemId) {
+  return `https://img-api.neople.co.kr/df/items/${encodeURIComponent(itemId)}`;
+}
+
+// 최근 90일 ‘태초’ 드랍 리스트(타임라인의 itemRarity 우선)
+async function listAncientDrops({ serverId, characterId }) {
+  const endISO = isoSec(new Date());
+  const startISO = isoSec(Date.now() - 90 * 24 * 60 * 60 * 1000);
+
   const events = await fetchTimelineAll({
     serverId,
     characterId,
     startISO,
     endISO,
-    limit: 100,
+    limit: 50,
   });
   if (!Array.isArray(events) || events.length === 0) return [];
 
-  // itemId 수집 → 다건 상세 조회(최대 15개/회, 여기선 간단히 15개 단위 배치)
-  const itemIds = events.map((ev) => ev?.data?.itemId).filter(Boolean);
-  const batches = [];
-  const uniq = [...new Set(itemIds)];
-  for (let i = 0; i < uniq.length; i += 15) batches.push(uniq.slice(i, i + 15));
-
-  const byId = new Map();
-  for (const ids of batches) {
-    const rows = await fetchItemsDetail(ids);
-    rows.forEach((r) => byId.set(r.itemId, r)); // {itemId, itemName, rarity, ...}
-  }
-
-  // “태초”만 필터링하여 정렬(최신 먼저)
   const drops = [];
   for (const ev of events) {
-    const itemId = ev?.data?.itemId;
+    const d = ev?.data || {};
+    const itemId = d.itemId;
     if (!itemId) continue;
-    const info = byId.get(itemId);
-    if (!info || info.rarity !== "태초") continue;
+
+    // 타임라인 자체 희귀도 우선
+    if (!isAncientRarity(d.itemRarity)) continue;
+
     drops.push({
       itemId,
-      itemName: info.itemName,
+      itemName: d.itemName,
       time: ev?.date || endISO,
-      // 아이템 이미지 URL (공식 공지 안내) :contentReference[oaicite:2]{index=2}
-      image: `https://img-api.neople.co.kr/df/items/${encodeURIComponent(
-        itemId
-      )}`,
+      image: itemImageURL(itemId),
     });
   }
+  // 최신순
   drops.sort((a, b) => b.time.localeCompare(a.time));
   return drops;
 }
 
-// 캐릭터 요약 API
+/* =======================
+   라우트
+======================= */
+
+// 헬스체크
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// 간단 구독 테이블
+const subscriptions = new Map(); // key: `${serverId}:${characterId}`
+
+app.post("/subscribe", (req, res) => {
+  try {
+    const serverId = String(req.body?.serverId || "").trim();
+    const characterId = String(req.body?.characterId || "").trim();
+    if (!serverId || !characterId) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "serverId, characterId 필요" });
+    }
+    const key = `${serverId}:${characterId}`;
+    if (!subscriptions.has(key)) {
+      subscriptions.set(key, {
+        serverId,
+        characterId,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    return res.json({
+      ok: true,
+      serverId,
+      characterId,
+      count: subscriptions.size,
+    });
+  } catch (e) {
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || "subscribe failed" });
+  }
+});
+
+// 닉네임 자동완성 (serverId + name)
+app.get("/search-character", async (req, res) => {
+  try {
+    let serverId = normalizeServerId(String(req.query.serverId || ""));
+    const name = String(req.query.name || "").trim();
+    if (!serverId || !name) {
+      return res
+        .status(400)
+        .json({ ok: false, message: "serverId, name 필요" });
+    }
+    const rows = await searchCharacters({ serverId, name, limit: 10 });
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+
+// 캐릭터 요약(기본정보 + 최근 90일 태초 이력)
+// - characterId 또는 characterName 중 하나만 줘도 됨
 app.get("/character/summary", async (req, res) => {
   try {
     let serverId = normalizeServerId(String(req.query.serverId || ""));
-    let { characterId, characterName } = req.query ?? {};
-    characterId = characterId ? String(characterId).trim() : "";
-    characterName = characterName ? String(characterName).trim() : "";
+    let characterId = String(req.query.characterId || "").trim();
+    const characterName = String(req.query.characterName || "").trim();
 
     if (!serverId || (!characterId && !characterName)) {
       return res.status(400).json({
@@ -479,82 +314,131 @@ app.get("/character/summary", async (req, res) => {
       });
     }
 
-    // 닉네임으로 들어오면 ID 변환 (완전일치→match 순서)
-    if (!characterId && characterName) {
+    // 닉네임 → ID 변환
+    if (!characterId) {
       const baseUrl = `${API_HOST}/df/servers/${encodeURIComponent(
         serverId
       )}/characters`;
-      const common = { apikey: NEOPLE_API_KEY, limit: 10 };
-
       const { data: d1 } = await axios.get(baseUrl, {
-        params: { ...common, characterName, wordType: "full" },
+        params: {
+          apikey: NEOPLE_API_KEY,
+          characterName,
+          wordType: "full",
+          limit: 10,
+        },
         timeout: 10000,
       });
-      let candidates = Array.isArray(d1?.rows) ? d1.rows : [];
-      if (candidates.length === 0) {
+      let rows = Array.isArray(d1?.rows) ? d1.rows : [];
+      if (rows.length === 0) {
         const { data: d2 } = await axios.get(baseUrl, {
-          params: { ...common, characterName, wordType: "match" },
+          params: {
+            apikey: NEOPLE_API_KEY,
+            characterName,
+            wordType: "match",
+            limit: 10,
+          },
           timeout: 10000,
         });
-        candidates = Array.isArray(d2?.rows) ? d2.rows : [];
+        rows = Array.isArray(d2?.rows) ? d2.rows : [];
       }
-      if (candidates.length === 0)
-        return res
-          .status(404)
-          .json({ ok: false, message: "닉네임으로 캐릭터를 찾을 수 없음" });
+      if (rows.length === 0)
+        return res.status(404).json({
+          ok: false,
+          message: "닉네임으로 캐릭터를 찾을 수 없습니다.",
+        });
       const exact =
-        candidates.find((r) => r.characterName === characterName) ||
-        candidates[0];
+        rows.find((r) => r.characterName === characterName) || rows[0];
       characterId = exact.characterId;
-      // 조회된 정확한 닉네임으로 덮어두기
-      characterName = exact.characterName;
     }
 
     // 기본정보
-    const basic = await fetchCharacterBasic({ serverId, characterId }); // endpoint 존재(캐릭터 기본 정보) :contentReference[oaicite:3]{index=3}
+    const basic = await fetchCharacterBasic({ serverId, characterId });
 
-    const characterImage = `https://img-api.neople.co.kr/df/servers/${encodeURIComponent(
-      serverId
-    )}/characters/${encodeURIComponent(characterId)}?zoom=2`;
+    // 최근 90일 타임라인
+    const endISO = isoSec(new Date());
+    const startISO = isoSec(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const events = await fetchTimelineAll({
+      serverId,
+      characterId,
+      startISO,
+      endISO,
+      limit: 50,
+    });
 
-    // 90일간 ‘태초’ 드랍 리스트
-    const ancientDrops = await listAncientDrops({ serverId, characterId });
+    const ancientDrops = [];
+    for (const ev of events) {
+      const id = ev?.data?.itemId;
+      if (!id) continue;
+      const rarityFromTimeline = isAncientRarity(ev?.data?.itemRarity);
+      if (rarityFromTimeline) {
+        ancientDrops.push({
+          itemId: id,
+          itemName: ev?.data?.itemName,
+          time: ev?.date,
+          image: `https://img-api.neople.co.kr/df/items/${encodeURIComponent(
+            id
+          )}`,
+        });
+      }
+    }
+    ancientDrops.sort((a, b) => b.time.localeCompare(a.time));
 
     return res.json({
       ok: true,
       character: {
         serverId,
         characterId,
-        characterName: characterName || basic?.characterName,
+        characterName: basic?.characterName,
         level: basic?.level,
         jobName: basic?.jobName,
         jobGrowName: basic?.jobGrowName,
-        image: characterImage,
+        image: `https://img-api.neople.co.kr/df/servers/${encodeURIComponent(
+          serverId
+        )}/characters/${encodeURIComponent(characterId)}?zoom=2`,
       },
       ancientDrops,
     });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.response?.data || e.message });
+    const status = e?.response?.status || 500;
+    const payload = e?.response?.data || {
+      message: e.message || "unknown error",
+    };
+    console.error("[/character/summary] error", status, payload);
+    return res.status(status).json({ ok: false, error: payload });
   }
 });
 
-setInterval(async () => {
-  if (subscriptions.size === 0 || !NEOPLE_API_KEY) return;
-  const now = Date.now();
-  for (const [, sub] of subscriptions) {
-    const last = sub._lastRunAt || 0;
-    if (now - last < POLL_INTERVAL_SEC * 1000 - 200) continue;
-    sub._lastRunAt = now;
-    await handleOneSubscription(sub);
-  }
-}, 1000);
+const sseClients = new Set();
+
+app.get("/events", (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.flushHeaders?.();
+
+  // 최초 인사 + 연결 확인용 ping
+  res.write(`event: ping\ndata: "connected"\n\n`);
+  sseClients.add(res);
+
+  // 30초마다 keep-alive
+  const timer = setInterval(() => {
+    try {
+      res.write(`event: ping\ndata: "${Date.now()}"\n\n`);
+    } catch {}
+  }, 30000);
+
+  req.on("close", () => {
+    clearInterval(timer);
+    sseClients.delete(res);
+  });
+});
 
 /* =======================
-   서버 시작
+   서버 기동
 ======================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`DF watcher listening on :${PORT}`);
+  console.log(`DF API server listening on :${PORT}`);
 });
